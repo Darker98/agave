@@ -152,6 +152,9 @@ impl Server {
         // validated so this won't panic).
         let (allocator_file, tpu_to_pack_allocator) = Self::create_allocator(&logon)?;
 
+        // Setup up_status file
+        let (upstatus_file, upstatus_ptr) = Self::create_upstatus()?;
+
         // Setup the global queues.
         let (tpu_to_pack_file, tpu_to_pack_queue) =
             Self::create_producer(logon.tpu_to_pack_capacity, true)?;
@@ -194,8 +197,9 @@ impl Server {
                 },
                 progress_tracker,
                 workers,
+                upstatus: upstatus_ptr
             },
-            [allocator_file, tpu_to_pack_file, progress_tracker_file]
+            [allocator_file, tpu_to_pack_file, progress_tracker_file, upstatus_file]
                 .into_iter()
                 .chain(worker_files)
                 .collect(),
@@ -225,6 +229,33 @@ impl Server {
 
         // Try to create with huge pages, fallback to regular pages.
         create(true).or_else(|_| create(false))
+    }
+
+    fn create_upstatus() -> Result<(File, *mut UpStatusMessage), std::io::Error> {
+        // Create the shmem file
+        let file = Self::create_shmem(false)?;
+
+        // Size file correctly
+        let size = std::mem::size_of::<UpStatusMessage>();
+        file.set_len(size as u64)?;
+
+        // mmap file
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok((file, ptr as *mut UpStatusMessage))
     }
 
     fn create_producer<T>(
@@ -342,12 +373,19 @@ impl Server {
     }
 }
 
+#[repr(C)]
+/// Up Status message
+pub struct UpStatusMessage {
+    pub timestamp: i64, // last time message was sent
+}
+
 /// An initialized scheduling session.
 pub struct AgaveSession {
     pub flags: u16,
     pub tpu_to_pack: AgaveTpuToPackSession,
     pub progress_tracker: shaq::Producer<ProgressMessage>,
     pub workers: Vec<AgaveWorkerSession>,
+    pub upstatus: *mut UpStatusMessage,
 }
 
 /// Shared memory objects for the tpu to pack worker.
